@@ -1,0 +1,546 @@
+Kubernetes on OVH Public Cloud
+------------------------------
+
+This tutorial explains step by step how to put in place a Kubernetes infrastructure on an OVH Public Cloud.
+
+In order to explore the different mechanisms offered by Kubernetes and OVH infrastructure, it targets the implementation of a high-loaded webserver, with the following architecture : 
+
+* A reverse http proxy receives public HTTP requests, and depending on the URI, redirects the query to proper internal HTTP server,
+* A first dedicated internal HTTP server deserves static files of the website,
+* A second dedicated internal HTTP server implements webservice,
+* A postgresql database holds all persistent data of the service.
+
+Prerequises
+~~~~~~~~~~~
+
+Some prerequises before starting this tutorial:
+
+* Be familiar with Kubernetes concepts: https://kubernetes.io/docs/concepts/
+* Have an OVH Public Cloud Project
+* Install Docker on your development machine : https://www.docker.com/
+* Install kubectl utility on your development machine : https://kubernetes.io/docs/tasks/tools/
+
+Warning
+~~~~~~~
+
+OVH Public Cloud is a pay-per-use service. When executing some of the commands described in this tutorial, you will instanciate resources which will be billed by OVH (in particular Object Storage and Load Balancer). Please check OVH Tarifs for more information
+
+Overview
+~~~~~~~~
+
+To implement a scalable architecture for our webserver, we will divide it in 4 Kubernetes services:
+
+* proxy : this service will implement the reverse proxy. It will use a Public Load Balancer to offer a public IP on which website clients will connect, and to balance the load on different Kumbernetes nodes (each node implemented in OVH public cloud Compute instance). 
+* http : this service will manage HTTP queries to static files of the website (html, css, js, etc.).
+* webservice : this service will implement the dynamic part of the website : implemented in PHP, it will use the database service to perform SQL queries
+* database : this service will host a postgresql database, and will use a persistent storage, using an OVH Block Storage.
+
+Kubernetes will deploy services as containerized applications which will run in Pods, distributes in different nodes. So, for example, in our tutorial, the proxy service will consist in one application, executed in one or more pods, executed in a cluster of nodes. The load balancer will round-robin the queries from the clients to the differents nodes which run this service. So, in order to scale our website, we will just need to increase the number of nodes of the cluster, and request Kubernetes controller to deploy more pods for proxy service.
+
+The same applies to the other services, except that, as they do not need to be accessible from public IP, no load-balancer will be associated. Instead, we will associate to each service a private IP address, which will also round-robin the queries from the other Kubernetes services to the differents nodes which run the targetted service. Once again, we will be able to scale our website by increasing the number of nodes which will run a dedicated service.
+
+See section Application Note here below for further explanations on how we will write our applications.
+
+The first step is thus to build the four containerized applications which will compose our system.
+
+Creation of the Apps
+~~~~~~~~~~~~~~~~~~~~
+
+In this tutorial, we will use Docker to compose our containerized applications.
+
+To deploy the applications in your Kubernetes cluster, you will need to push those applications in a registry.
+
+Your OVH Public Cloud project allows you to create a private registry. But this one is quite expansive. So, for this tutorial, I used a free public registry : https://hub.docker.com/
+
+You can create an account, and create as many public repositories as you want. My account is 'briceandre' and I created 4 public repositories, each one named with the corresponding Kubernetes service.
+
+If you want to experiment it yourself, you will have to create your own account, create the four repositories, and adapt the commands here below accordingly.
+
+Note that, as the repositories used in this tutorial are public, you can skip the applications creation, and use the ones in repositories pointed by this tutorial.
+
+
+Proxy service
+^^^^^^^^^^^^^
+
+This service will run an apache webserver in a debian linux distribution.
+
+To generate it, go in the proxy subfolder, and execute following command (do not forget to adapt repository path):
+[source]
+-----------------
+docker build -t briceandre/proxy .
+-----------------
+If you open your Docker desktop application, you will see the corresponding image. 
+
+Note that to debug this image, you can run it on your local docker environment. It will allow you to enter a shell session in the application, see the logs, etc.
+
+To understand how this application is constructed, you must look in the two files located in the proxy subfolder. The first one, Dockerfile, is the main one which gives all instructions to Docker :
+[source]
+-----------------
+FROM debian:stable-slim
+
+LABEL version="1.0" maintainer="ANDRE Brice <brice.andre@ams-solutions.be>"
+
+RUN apt-get update -y && apt-get install -q -y apache2
+
+COPY proxy.conf  /etc/apache2/sites-available/proxy.conf
+
+RUN a2enmod proxy
+RUN a2enmod proxy_http
+RUN a2enmod proxy_balancer
+RUN a2enmod lbmethod_byrequests
+
+RUN a2dissite 000-default.conf
+RUN a2ensite proxy.conf 
+
+EXPOSE 80
+
+ENTRYPOINT apache2ctl -D FOREGROUND
+-----------------
+
+The first line instructs Docker that we will use an existing image, as basis for our custom image : debian. Last part of the line is a tag to the version of the image to use.
+[source]
+-----------------
+FROM debian:stable-slim
+-----------------
+Second line will add metadata information to the image:
+[source]
+-----------------
+LABEL version="1.0" maintainer="ANDRE Brice <brice.andre@ams-solutions.be>"
+-----------------
+The RUN lines will allow to execute commands within the image application. The will be used to deploy and configure the applications.
+
+The COPY lines will allow to copy files located in your local folder within the image.
+
+The next lines of the Dockerfile will : 
+
+* install apache web-server
+* copy the local apache configuration file in the final image
+* enable the needed apache modules
+* deactivate the default http site coming with apache distribution
+* activate the site implementing our reverse proxy (see proxy.conf local file)
+
+The next line instructs Docker that it must expose the HTTP port (80) :
+[source]
+-----------------
+EXPOSE 80
+-----------------
+Note that in our example, we only implement an HTTP site. On a production web-site, we would also implement HTTPS, and thus expose port 443.
+
+The last line instructs Docker which command execute as entry point of our application:
+[source]
+-----------------
+ENTRYPOINT apache2ctl -D FOREGROUND
+-----------------
+An important remark : the containerized application will end when the entry point will return. This is the reason of the -D FOREGROUND. If you omit it, apache will be launched in background. The command will thus return immediately, and your application will stop running !
+
+Http service
+^^^^^^^^^^^^
+
+This service will also run an apache webserver in a debian linux distribution.
+
+All static files served by this image are located in the local sub-folder html.
+
+To generate it, go in the http subfolder, and execute following command (do not forget to adapt repository path):
+[source]
+-----------------
+docker build -t briceandre/http .
+-----------------
+
+Structure of this file is similar to the one used for proxy image. There is one additional command used : 
+[source]
+-----------------
+COPY html /var/www/html
+-----------------
+
+This command copies the full local repository in image. For this image, we keep the default website configuration file coming with apache distribution : we simply replace all files with the ones located in the local html folder
+
+
+Webservice service
+^^^^^^^^^^^^^^^^^^
+
+This service will also run an apache webserver in a debian linux distribution.
+
+All static files served by this image are located in the local sub-folder html.
+
+To generate it, go in the http subfolder, and execute following command (do not forget to adapt repository path):
+[source]
+-----------------
+docker build -t briceandre/webservice .
+-----------------
+
+Structure of this file is similar to the one used for http image. Note the following additional line : 
+[source]
+-----------------
+RUN rm /var/www/html/*
+-----------------
+
+Default html site coming with apache distribution includes an index.html file. As our local html directory contains an index.php file, if we keep original file, the server will provide content of index.html file instead of our index.php when the / URI is hit.
+
+database service
+^^^^^^^^^^^^^^^^^^
+
+For this service, we will start from a docker image already embedding a postgresql server.
+
+To generate it, go in the http subfolder, and execute following command (do not forget to adapt repository path):
+[source]
+-----------------
+docker build -t briceandre/database .
+-----------------
+
+Here is the content of this file:
+[source]
+-----------------
+FROM postgres
+
+LABEL version="1.0" maintainer="ANDRE Brice <brice.andre@ams-solutions.be>"
+
+ENV POSTGRES_USER data_user
+ENV POSTGRES_PASSWORD data_password
+ENV POSTGRES_DB data_db
+ENV PGDATA /home/data/db
+
+COPY init.sql /docker-entrypoint-initdb.d/
+-----------------
+
+The lines starting with ENV allow to tune the default postgres image. See https://hub.docker.com/_/postgres for more info.
+
+An important line is the following:
+[source]
+-----------------
+ENV PGDATA /home/data/db
+-----------------
+
+It will allow to place postgresql database files to a default path. As we will see later, we wil configure our Pod implementing this service to mount an OVH Block Storage device on this location, so that we can guarantee a persistent database.
+
+Loading the apps in the registry
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This step will allow to make the images you have just built accessible to your OVH Kubernetes cluster.
+
+As explained in the introduction, in this tutorial, we will use the free public Docker registry.
+
+Note that those commands will load the images in my public repository. As you do not have write access to this repository, you will have to adapt those commands to point to your own repository.
+
+PREREQUISE : you must have a valid Docker account (https://hub.docker.com/) and you must already have created the four repositories in the interface of your account !
+
+First, you must authenticate to your docker account. To do so, execute the following command:
+[source]
+-----------------
+docker login
+-----------------
+
+Once done, you can push your 4 local images to corresponding repositories (do not forget to adapt the commands to match your account !):
+[source]
+-----------------
+docker push briceandre/proxy
+docker push briceandre/http
+docker push briceandre/webservice
+docker push briceandre/database
+-----------------
+
+
+Application Notes
+~~~~~~~~~~~~~~~~~
+
+The goal of this tutorial is not to explain you how to do web development. But some notes may be interesting to explain how to tune the architecture of your application to benefit from Kubernetes cluster.
+
+By dividing the application in four services, we allow the dispatch of the processing on different group of servers. In our example, a typical client request will be dispatched as follows:
+
+* When the client will enter our server URI in its web browser, it will be redirected to the load balancer associated to our proxy service. If the proxy service is composed of more than 1 replicas, the load balancer will dispatch the queries of all clients on the different servers which support the proxy application, allowing you to tune the number of replicas depending on your webite load.
++
+In our example, the proxy is a stateless application. So, there is no real restriction on multiplying the number of nodes. 
++
+On a real webserver, we would probably implement HTTPS. In this case, the proxy would be in charge of tranferring all HTTPS requests from the clients, to corresponding internal webservers, in HTTP. But in this case, the application would no more be stateless : to be efficient, the proxy would have to maintaint TLS connexions between requests. This is generally done at load-balancer level, either by letting this device manage the whole TLS stuff, or by configuring it to maintain TLS connexions by routing them, once established, to the same serve.
+* When an instance of our proxy application receives a request to the / URI, following the rules declared in our proxy.conf file, it will route it to internal http://http/ . By doing so, the proxy application will perform a dns resolution of "http" hostname, which Kubernetes environment will associate to private IP address associated to our http service. 
++
+The Kubernetes environment will, in this case, play the role of our load-balancer : it will balance the different internal requests to this service between the different pods which implement this service. 
+* In our example, http service is a stateless architecture. So, event if different requests of a same client are dispatched to different internal servers, this will not be an issue. 
+* When the client will perform a request to URI /webservice of our website, the same process will apply. But this time, the proxy will redirect to internal http://webservice/ , which will be redirected to our webservice service.
+* Here, in the implementation of our webservice, it is thus important to implement a stateless application. If, for example, you decide to use PHP session to follow user connexions, you will probably be in troubles : different queries may hit different nodes implementing webservice, which may result in user not being connected for some of them !
+* The webservice, when connecting to database, uses host "database" (see connection string in index.php file). Once again, Kubernetes infrastructure will dispatch those connexions between the different instances of this service.
+* Written as-is, our database service cannot be deployed on more than one POD : the second POD would request the same PVC, which is configured in ReadWriteOnce. All subsequent PODs would thus fail. 
++
+Note that, if we change the ReadWriteOnce property, we will have other troubles : a postgresql database cannot share its intenal db storage files with multiple instances, which would probably lead to corrupted database. 
++
+If you need multiple nodes for your database, you should envisage putting in place a db cluster. In such case, maybe postgresql is not an option for you, and you should envisage an alternative, like MongoDB ?
+
+
+Preparing your OVH Public Cloud infrastructure
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Now, it's time to populate all needed OVH services. If you are not already done, please prepare the following : 
+
+* A public cloud project. At the time of writing this artictle, an OVH Public Cloud project is free, but you need to charge your account with 10€, which can be later used to pay the additional services. Note that if you allocate a reasonable amount of resources, and if you keep the project online a reasonable time, those 10€ will be largly sufficient to put in place this tutorial.
+* Within this project, configure a vRack, and a private network. This step is optional : you can configure your Kubernetes cluster to use public IP, but in a production environment, this solution is most probably not acceptable. Note that, at the time of wrigin this arictle, VRack and private network are free.
+* Create your Kubernetes cluster, associate it to your private network (if you chose this option), and create a first cluster of nodes. Note that, for this tutorial, you can run all services with only 1 pod per service, and locate all pods in one single node. So, even if by default, OVH proposes you a cluster of 3 nodes, you can create a cluster with one single node. For production, if you envisage creating a cluster of one node, you should probably question yourself with the necessity to put in place a Kubernetes architecture !
++ 
+In OVH Public Cloud, a Kubernetes node is instanciated by a CPU Public Cloud Instance. At the time of writing this article, the cheaper instance you can associate to a Kubernetes cluster is a D2-4 model (10€/month). You can pay your usage per hour, in which case the cost is doubled. So, if you create a cluster of 1 node, payed per hour, it will cost you less than 1€ per 24h of tests.
+
+The additional resoures we will need are : 
+
+* A block storage device to store your database files. You can create thos block-storages from your OVH dashboard, but I never found how to associate a block storage created from the dashboard to a Kubernetes cluster. So, we will create this block storage directly from command line later in the tutorial. This block storage will be charge also. At the time of writing this tutorial, the smallest size that can be created is 10Go, and is charged per hour, at 0.4€ for a month. 
+* A load-balancer. This load-balancer is automatically created when you start the proxy service, and is automatically deleted when you stop this service. At the time of writing this article, it is charged at 0,0134€ per hour.
+
+Launch your Kubernetes cluster
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Now, it's time to launch your cluster. To do so, we will use the kubectl command line, directly from our development PC. 
+
+To do so, you will first need to download from your OVH dashboard the kubeconfig.yml file. Once done, copy it in the root directory of the tutorial, and execute the following command (Windows) in a command line : 
+[source]
+-----------------
+SET KUBECONFIG=kubeconfig.yml
+-----------------
+
+Once done, each kubectl command invocation from this command line will manage your OVH Public Cloud Kubernetes project.
+
+
+Creation of the ObjectStorage to store database files
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+As previously explained, I did not succeed in creating an object storage from OVH dashboard, and associate it to my Kubernetes project.
+
+Moreover, I did not found any way to create a persistent volume, other that to introduce a PersistentVolumeClaim in my kubernetes project. This method has two disadvantages :
+
+* First, a persistent volume created like this has a reclaim policy to delete, which means that if you suppress the PersistentVolumeClaim, your volume is automatically deleted, which is probably not what you want in a production environment. I will detail here under how to correct this.
+* Second, it's not possible to choose the name of the volume. For a production environment, it may be a good idea to give an understandable name to your volumes.
+
+So, if you have a better way to proceed, feel free to comment this article : I will update it accordingly !
+
+To introduce the PersistentVolumeClaim, we use the PV_Create.yml file provided in the project. To apply it to your Kubernetes cluster, simply execute the following command:
+[source]
+-----------------
+kubectl apply -f PV_Create.yml
+-----------------
+
+You can test the creation of the associated PersistentVolume thanks to the following command (wait a few seconds between the two calls : creation is not immediate...):
+[source]
+-----------------
+kubectl get pv
+-----------------
+
+The output should be similar to :
+[source]
+-----------------
+NAME                                                                     CAPACITY  ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                  STORAGECLASS         REASON  AGE
+ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143   10Gi       RWO            Delete           Bound    default/database-pvc   csi-cinder-classic            7s
+-----------------
+
+Some usefule informations to note:
+* The name of the volume, in this case ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143, will be needed later. You will have to adapt the rest of this tutorial with the name of your volume
+* The status : bound. Your volume is currently bounded to the persistent volume claim we have just issued
+* the reclaim policy : delete. As is, if you suppress your PersistentVolumeClaim, you loose all your data !
+
+To solve this last issue, we will issue the following command:
+[source]
+-----------------
+kubectl patch pv ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143 -p "{\"spec\":{\"persistentVolumeReclaimPolicy\":\"Retain\"}}"
+-----------------
+
+Now, if you issue the "get pv" command, you will see that the reclaim policy has changed. Your volume is now safe : even if you destroy all Kubernetes elements, your data is safe in your OVH Public Cloud project.
+
+You can observe this by suppressing the PersistentVolume Claim:
+[source]
+-----------------
+kubectl delete pvc database-pvc
+-----------------
+
+Your volume is still present. But its state is now 'Released'. In this state, the persistent volume is still associated to the deleted PersistentVolumeClaim, and will thus not be usable for a new association. To solve this issue, execute the following command :
+[source]
+-----------------
+kubectl patch pv ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143 -p "{\"spec\":{\"claimRef\": null}}"
+-----------------
+
+Now, you can check that the new status of your volume is "Available". The volume is ready and we can proceed to the installation of our services and deployments
+
+WARNING : note that, now that the volume is created, you start paying for it. You will pay up to its deletion (see below).
+
+Deployment of the service
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For those who want to see it in action immediately, simply execute the following command (do not forget to patch this file with your volume name, and your Docker public respositories !):
+[source]
+-----------------
+kubectl apply -f deployment.yml  -n default
+-----------------
+
+Your service is now starting. To monitor it, you can issue the following commands:
+[source]
+-----------------
+kubectl get pods -n default
+kubectl get services -n default
+-----------------
+
+If everything goes well, the first command will show you the 4 pods with status 'running' (this may take a few seconds for initialisation).
+
+The second command will show your the status of the services. One important line is the one associated to the proxy:
+[source]
+-----------------
+NAME         TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+proxy        LoadBalancer   10.3.104.255   51.91.81.75   80:30196/TCP   100s
+-----------------
+
+It may take a few minutes to properly deploy, but once properly deployed, you will find the public IP address OVH has attributed to your load balancer (EXTERNAL-IP). This is the address on which you can test your service. In our case: http://51.91.81.75
+
+CAVEAT: each time you will restart your service, OVH will attribute you a new IP address, which is not very nice for a production server. I will try to update this tutorial with a procedure to associate a failover IP address to your load balancer later.
+
+WARNING: do not forget that you pay resources per use:
+
+* the CPU resouces are payed starting from creation of your nodes pool in your OVH dashboard. To stop  paying them, you must go in the OVH dashboard, and suspend them. 
+* The ObjectStorage is payed until its creation, up to its deletion. See below how to delete it.
+* The load balancer is payed when the proxy service is running. If you stop it, you stop paying the load balancer, but you loose your public IP.
+
+Go deeper in the deployment :
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Now, it's time to dig in the deployment.yml file, and understand how this works !
+
+PersistentVolumeClaim:
+^^^^^^^^^^^^^^^^^^^^^^
+
+The first statement in this file aims at obtaining the Persistant volume, and make it available for the database service. To do so, we use the following section:
+[source]
+-----------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: csi-cinder-classic
+  volumeName: ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143
+-----------------
+
+Note the following points :
+
+* volumeName : this points to the previously created volume. You must adapt it to the name of your previously created volume
+* name : this is the name I gave to this PVC. It will be used later to associate this volume to the pod hosting the database service
+
+Note that if you are not interested in creating a volume that persists after a PVC deletion, you could simply skip the creation of the ObjectStorage, and patch the deployment.yml file by removing the volumeName declaration. In this case, a persistent volume will automatically be created when you will deploy your services.
+
+Creation of the services:
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The second part of the file delcare the different services available in our Kubernetes cluster. 
+
+[source]
+-----------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy
+  labels:
+    app: proxy
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: proxy
+-----------------
+
+Note the following points:
+
+* type: loadBalancer. By declaring this, we request OVH to associate a loadBalancer to our service, and to make it accessible from public IP address. 
++
+If we omit it (as done for other services), we create the default type ClusterIP, which associates a private IP to the service, accessible only from the Kubernetes cluster.
+* app: proxy. Here, we asociate the application proxy to our service. We will define the application in the deployment part, see below
+
+The file declares on the same way the 3 other services which will be managed by our Kubernetes cluster.
+
+Creation of the deployments:
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The last part ot the file declares the different deployments. Here, we declare one deployment per service, and for each deployment, we specify the images used by the associated pods.
+
+
+[source]
+-----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webservice
+  labels:
+    app: webservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webservice
+  template:
+    metadata:
+      labels:
+        app: webservice
+    spec:
+      containers:
+      - name: database
+        image: briceandre/webservice
+        ports:
+        - containerPort: 80
+-----------------
+
+Note the following points:
+
+* replicas : this is where you request the number of pods used to serve your application. In our case, we run only one replica for each service. On a production environment, we would probably need to implement several dedicated nodes for each service.
+* image : this is where we point to our docker registry. You probably should adapt this line to point on your own registry
+
+Stop the services:
+~~~~~~~~~~~~~~~~~~
+
+And if you want to stop everything ? Simply delete all services and deployments :
+
+[source]
+-----------------
+kubectl delete service proxy -n default
+kubectl delete service http -n default
+kubectl delete service webservice -n default
+kubectl delete service database -n default
+
+kubectl delete deploy proxy -n default
+kubectl delete deploy http -n default
+kubectl delete deploy webservice -n default
+kubectl delete deploy database -n default
+-----------------
+
+To entirely cleanup the cluster, you will also need to suppress the PVC : 
+[source]
+-----------------
+kubectl delete pvc database-pvc
+-----------------
+
+Do not forget, as explained above, to release also the PV, and make it available for a new PVC : 
+
+[source]
+-----------------
+kubectl patch pv ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143 -p "{\"spec\":{\"claimRef\": null}}"
+-----------------
+
+From this point, you can restart again your service with :
+
+[source]
+-----------------
+kubectl apply -f deployment.yml  -n default
+-----------------
+
+It will restart a fresh new cluster, but will reuse your PV with database content.
+
+WARNING: Do not forget that stopping your cluster does not stop the payed services : you are still paying for CPU resources and BlockStorage associated to your PV !
+
+
+Suppression of your PersistentVolume:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is possible direcly from your OVH dashboard, or in command line. For this latest:
+[source]
+-----------------
+kubectl delete pv ovh-managed-kubernetes-z73ynm-pvc-bd48cc91-fa23-461b-9b7b-5b10a1dd8143
+-----------------
+
+Note that, by doing so, you will loose all data !

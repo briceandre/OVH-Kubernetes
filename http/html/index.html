@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="fr">
+   <head>
+      <title>My first Kubernetes based web-site</title>
+      <script src="jquery.min.js"></script>
+   </head>
+
+   <body>
+
+      <button id="the-button">Click here to get local time</button>
+      <div id="the-div"></div>
+
+      <script>
+         $(document).ready(function()
+         {
+            $("#the-button").click(function()
+            {
+               $('#the-div').append("<p>New request...</p>");
+               $.getJSON( "/webservice", function( data )
+               {
+                  $('#the-div').append("<p>Response : "+data.nb_requests+" nb hits, "+data.time+"</p>");
+               });
+            });
+         });
+      </script>
+   </body>
+</html>
